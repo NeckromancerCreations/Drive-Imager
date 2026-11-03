@@ -21,7 +21,7 @@ A free backup app for Windows that images a running drive, like C:, into a singl
 
 ## Download
 
-Grab `DriveImager.exe` from the [Releases](../../releases) page and run it. It uses the PowerShell and .NET Framework that already ship with Windows 10 and 11.
+**[Download DriveImager.exe](https://github.com/NeckromancerCreations/-Drive-Imager/raw/main/DriveImager.exe)** and run it. It uses the PowerShell and .NET Framework that already ship with Windows 10 and 11.
 
 It asks for administrator rights when it starts, because Windows only lets admin programs snapshot drives.
 
@@ -83,6 +83,7 @@ No SDK or Visual Studio needed. Windows includes the C# compiler. Double click `
 | --- | --- |
 | `DriveImager.ps1` | The app itself (PowerShell with a WPF window) |
 | `DriveImager_Restore.cmd` | Restore wizard for a Windows install USB |
+| `DriveImager.exe` | Ready to run build of the app |
 | `DriveImager.cs` | Small launcher that becomes `DriveImager.exe` and carries the two files above |
 | `Drive_Imager.bat` | Starts the script without the exe |
 | `app.ico` | App icon |

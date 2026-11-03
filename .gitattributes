@@ -1,0 +1,5 @@
+# Windows scripts must keep CRLF line endings, so git stores them exactly as they are.
+*.cmd -text
+*.bat -text
+*.ps1 -text
+*.ico binary

@@ -410,9 +410,9 @@ $xaml = @'
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
         <StackPanel VerticalAlignment="Center" Margin="0,0,20,0">
-          <TextBlock x:Name="tbStatus" Text="Ready" FontWeight="SemiBold"/>
+          <TextBlock x:Name="tbStatus" Text="Ready" FontWeight="SemiBold" FontSize="14" TextWrapping="Wrap"/>
           <ProgressBar x:Name="pb" Height="8" Margin="0,6,0,4" Maximum="100" Foreground="{StaticResource Accent}" Background="#E5E7EB" BorderThickness="0"/>
-          <TextBlock x:Name="tbProgressText" Style="{StaticResource Hint}"/>
+          <TextBlock x:Name="tbProgressText" Style="{StaticResource Hint}" TextWrapping="Wrap"/>
         </StackPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
           <Button x:Name="btnCancel" Content="Cancel" Style="{StaticResource Danger}" Margin="0,0,10,0" IsEnabled="False"/>
@@ -450,6 +450,10 @@ $script:JobOnDone = $null
 $script:CloseAfterJob = $false
 $script:ForceClose = $false
 $script:Volumes = @()
+$script:Samples = New-Object System.Collections.Generic.List[object]
+$script:EtaSmooth = -1
+$script:HistoryHint = ''
+$script:NextStepHint = ''
 
 # ---------------------------------------------------------------- helpers (UI thread)
 function Format-Bytes([double]$b) {
@@ -1673,6 +1677,45 @@ finally {
     return @{ PS = $ps; RS = $rs; Handle = $ps.BeginInvoke() }
 }
 
+# ---------------------------------------------------------------- time left
+function Format-Span([double]$Seconds) {
+    if ($Seconds -lt 60) { return 'under a minute' }
+    $m = [int][math]::Round($Seconds / 60)
+    if ($m -lt 60) { return "$m min" }
+    $h = [int][math]::Floor($m / 60); $mm = $m % 60
+    if ($mm -eq 0) { return "$h h" }
+    return "$h h $mm min"
+}
+
+function Get-StepEta([double]$P) {
+    # Seconds left in the current step, or -1 while there is not enough to go on.
+    # Blends the speed over the last 5 minutes with the average since the step began,
+    # so it follows real slowdowns (big files, busy network) without jumping around.
+    $now = Get-Date
+    $script:Samples.Add([pscustomobject]@{ T = $now; P = $P })
+    while ($script:Samples.Count -gt 2 -and ($now - $script:Samples[0].T).TotalMinutes -gt 5) { $script:Samples.RemoveAt(0) }
+    $stepSec = ($now - $script:PhaseStart).TotalSeconds
+    if ($P -lt 0.5 -or $stepSec -lt 20) { return -1 }
+    $rate = $P / $stepSec
+    $old = $script:Samples[0]
+    $winSec = ($now - $old.T).TotalSeconds
+    if ($winSec -ge 60 -and $P -gt $old.P) { $rate = ((($P - $old.P) / $winSec) * 2 + $rate) / 3 }
+    if ($rate -le 0) { return -1 }
+    $eta = (100 - $P) / $rate
+    if ($script:EtaSmooth -ge 0) { $eta = $script:EtaSmooth * 0.8 + $eta * 0.2 }
+    $script:EtaSmooth = $eta
+    return $eta
+}
+
+function Reset-StepEta { $script:Samples.Clear(); $script:EtaSmooth = -1 }
+
+function Set-TaskbarProgress([string]$State, [double]$Value = 0) {
+    $t = $window.TaskbarItemInfo
+    if (-not $t) { return }
+    $t.ProgressState = $State
+    if ($State -ne 'Indeterminate' -and $State -ne 'None') { $t.ProgressValue = [math]::Max(0, [math]::Min(1, $Value)) }
+}
+
 function Start-Worker {
     param([string]$Title, [scriptblock]$Body, [hashtable]$Cfg, [scriptblock]$OnDone, [string]$Kind = 'Task')
     if ($script:Busy) { Show-Msg 'Another job is already running.'; return }
@@ -1684,6 +1727,15 @@ function Start-Worker {
     $script:JobStart = Get-Date
     $script:PhaseStart = Get-Date
     $script:PhaseName = $Title
+    Reset-StepEta
+    $script:HistoryHint = ''
+    $script:NextStepHint = ''
+    if ($Kind -eq 'WIM' -or $Kind -eq 'WSB') {
+        $prev = @(Read-History | Where-Object { $_.Result -eq 'Succeeded' -and $_.Kind -eq $Kind })
+        if ($prev.Count) { try { $script:HistoryHint = 'your last backup took ' + (Format-Span ([TimeSpan]::Parse([string]$prev[-1].Duration)).TotalSeconds) } catch { } }
+        if ($Kind -eq 'WIM' -and $Cfg.Hash) { $script:NextStepHint = 'after the capture: a SHA256 checksum, which reads the image once more' }
+    }
+    Set-TaskbarProgress 'Indeterminate'
     $script:Busy = $true
     Set-BusyUi $true
     [void][DriveImagerNative]::SetThreadExecutionState([uint32]2147483649)   # keep the PC awake
@@ -1704,9 +1756,11 @@ function Complete-Worker {
     [void][DriveImagerNative]::SetThreadExecutionState([uint32]2147483648)
     $ok = [bool]$sync.Success
     $el = ((Get-Date) - $script:JobStart).ToString('hh\:mm\:ss')
-    if ($ok)              { $ui.pb.IsIndeterminate = $false; $ui.pb.Value = 100; $ui.tbStatus.Text = 'Finished'; $ui.tbProgressText.Text = "Took $el" }
-    elseif ($sync.Cancel) { $ui.pb.IsIndeterminate = $false; $ui.pb.Value = 0;   $ui.tbStatus.Text = 'Cancelled'; $ui.tbProgressText.Text = '' }
-    else                  { $ui.pb.IsIndeterminate = $false; $ui.pb.Value = 0;   $ui.tbStatus.Text = 'Failed: ' + $sync.Error; $ui.tbProgressText.Text = 'See the Log tab for details.' }
+    $window.Title = 'Drive Imager'
+    $fin = (Get-Date).ToString('h:mm tt')
+    if ($ok)              { $ui.pb.IsIndeterminate = $false; $ui.pb.Value = 100; $ui.tbStatus.Text = 'Finished'; $ui.tbProgressText.Text = "Took $el, finished at $fin"; Set-TaskbarProgress 'None' }
+    elseif ($sync.Cancel) { $ui.pb.IsIndeterminate = $false; $ui.pb.Value = 0;   $ui.tbStatus.Text = 'Cancelled'; $ui.tbProgressText.Text = ''; Set-TaskbarProgress 'None' }
+    else                  { $ui.pb.IsIndeterminate = $false; $ui.pb.Value = 0;   $ui.tbStatus.Text = 'Failed: ' + $sync.Error; $ui.tbProgressText.Text = 'See the Log tab for details.'; Set-TaskbarProgress 'Error' 1 }
     if ($script:JobKind -eq 'WIM' -or $script:JobKind -eq 'WSB') { Add-History $ok $script:JobKind 'Manual' $script:JobStart; Update-LastBackup }
     if ($script:CloseAfterJob) { $script:ForceClose = $true; $window.Close(); return }
     if ($script:JobOnDone) { & $script:JobOnDone $ok }
@@ -1722,19 +1776,30 @@ $timer.Add_Tick({
         if ($script:TickCount % 100 -eq 0) { Update-LastBackup; try { Update-ScheduleUi } catch { } }   # every 30 seconds
         return
     }
-    if ($sync.Status -ne $script:PhaseName) { $script:PhaseName = $sync.Status; $script:PhaseStart = Get-Date }
+    if ($sync.Status -ne $script:PhaseName) { $script:PhaseName = $sync.Status; $script:PhaseStart = Get-Date; Reset-StepEta }
     $p = [double]$sync.Progress
-    if ($p -lt 0) { $ui.pb.IsIndeterminate = $true }
-    else { $ui.pb.IsIndeterminate = $false; $ui.pb.Value = $p }
-    $total = (Get-Date) - $script:JobStart
-    $txt = 'Elapsed ' + $total.ToString('hh\:mm\:ss')
-    if ($p -ge 1 -and $p -lt 100) {
-        $phase = ((Get-Date) - $script:PhaseStart).TotalSeconds
-        $left = [TimeSpan]::FromSeconds([math]::Min(359999, $phase / $p * (100 - $p)))
-        $txt = ('{0:N1}%   |   ' -f $p) + $txt + '   |   about ' + $left.ToString('hh\:mm\:ss') + ' left'
+    if ($p -lt 0) { $ui.pb.IsIndeterminate = $true; Set-TaskbarProgress 'Indeterminate' }
+    else { $ui.pb.IsIndeterminate = $false; $ui.pb.Value = $p; Set-TaskbarProgress 'Normal' ($p / 100) }
+
+    $now = Get-Date
+    $capturing = ([string]$sync.Status) -like 'Capturing image*'
+    $head = [string]$sync.Status
+    $detail = 'Started ' + $script:JobStart.ToString('h:mm tt') + '   |   running for ' + ((($now - $script:JobStart)).ToString('hh\:mm\:ss'))
+    $eta = $(if ($p -ge 0 -and $p -lt 100) { Get-StepEta $p } else { -1 })
+    if ($p -ge 0) { $head += ('   {0:N1}%' -f $p) }
+    if ($eta -ge 0) {
+        $doneWord = $(if ($capturing -and $script:NextStepHint) { 'capture done around' } else { 'done around' })
+        $head += '   |   about ' + (Format-Span $eta) + " left, $doneWord " + $now.AddSeconds($eta).ToString('h:mm tt')
+        $window.Title = ('{0:N0}%   {1} left   Drive Imager' -f $p, (Format-Span $eta))
     }
-    if (-not $sync.Cancel) { $ui.tbStatus.Text = $sync.Status }
-    $ui.tbProgressText.Text = $txt
+    elseif ($p -ge 0 -and $p -lt 100) {
+        $head += '   |   working out the time left...'
+        if ($script:HistoryHint -and $capturing) { $detail += '   |   ' + $script:HistoryHint }
+        $window.Title = ('{0:N0}%   Drive Imager' -f $p)
+    }
+    if ($capturing -and $script:NextStepHint) { $detail += '   |   ' + $script:NextStepHint }
+    if (-not $sync.Cancel) { $ui.tbStatus.Text = $head }
+    $ui.tbProgressText.Text = $detail
     if ($sync.Done) { Complete-Worker }
 })
 
@@ -2142,6 +2207,7 @@ try {
     Update-LastBackup
     if (Enter-JobLock) { Exit-JobLock; Clear-StaleSnapshot }
     Write-UiLog "Drive Imager ready. Logs are kept in $LogDir"
+    $window.TaskbarItemInfo = New-Object System.Windows.Shell.TaskbarItemInfo
     $timer.Start()
 
     $h = [DriveImagerNative]::GetConsoleWindow()

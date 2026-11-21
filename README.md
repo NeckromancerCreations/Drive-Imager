@@ -18,6 +18,7 @@ A free backup app for Windows that images a running drive, like C:, into a singl
 * **Images tab:** see image details, verify a checksum, **mount an image read only** to browse it in Explorer and copy files out, or delete old images.
 * **Restore notes** next to every image with your exact partition layout, plus a guided **restore wizard** (see below).
 * **Any drive:** NTFS drives are snapshotted. FAT32 and exFAT drives (USB sticks, SD cards) are copied directly.
+* **Time left you can trust:** a steady estimate of how long is left and the clock time it should finish, plus progress on the taskbar icon so you can check it while the window is minimized.
 * Optional **sleep or shut down** when the backup finishes, and a full log of every run.
 
 ## Download

@@ -251,6 +251,7 @@ $xaml = @'
                   <CheckBox x:Name="chkIntegrity" Content="Embed an integrity table in the image"/>
                   <CheckBox x:Name="chkHash" Content="Write a SHA256 checksum file when finished"/>
                   <CheckBox x:Name="chkReadme" Content="Write restore instructions next to the image"/>
+                  <CheckBox x:Name="chkSkipBlocked" Content="If Windows Security blocks a file, skip it and finish"/>
                 </StackPanel>
               </Border>
 
@@ -980,7 +981,7 @@ function Get-DefaultSettings {
         Source = $sysLetter; Engine = 'WIM'; Destination = $dest; NamePattern = 'Backup_{vol}_{date}_{time}'
         Description = ''; Compression = 1; Verify = $false; Integrity = $false; Hash = $true; Readme = $true
         ExTemp = $true; ExWU = $true; ExDumps = $true; ExDO = $true; ExCustom = ''
-        Retention = $false; KeepCount = '5'; After = 0; AllCritical = $true
+        Retention = $false; KeepCount = '5'; After = 0; AllCritical = $true; SkipBlocked = $true
         SchedFreq = 1; SchedDay = 0; SchedTime = '03:00'; SchedWake = $true
     }
 }
@@ -1013,6 +1014,7 @@ function Load-Settings {
     $ui.chkIntegrity.IsChecked = [bool]$s.Integrity
     $ui.chkHash.IsChecked = [bool]$s.Hash
     $ui.chkReadme.IsChecked = [bool]$s.Readme
+    $ui.chkSkipBlocked.IsChecked = [bool]$s.SkipBlocked
     $ui.chkExTemp.IsChecked = [bool]$s.ExTemp
     $ui.chkExWU.IsChecked = [bool]$s.ExWU
     $ui.chkExDumps.IsChecked = [bool]$s.ExDumps
@@ -1042,6 +1044,7 @@ function Get-UiSettings {
         Integrity   = [bool]$ui.chkIntegrity.IsChecked
         Hash        = [bool]$ui.chkHash.IsChecked
         Readme      = [bool]$ui.chkReadme.IsChecked
+        SkipBlocked = [bool]$ui.chkSkipBlocked.IsChecked
         ExTemp      = [bool]$ui.chkExTemp.IsChecked
         ExWU        = [bool]$ui.chkExWU.IsChecked
         ExDumps     = [bool]$ui.chkExDumps.IsChecked
@@ -1082,6 +1085,7 @@ function Add-History([bool]$Ok, [string]$Kind, [string]$Trigger, [datetime]$Star
         Target   = [string]$sync.OutFile
         Bytes    = $size
         Duration = ((Get-Date) - $Started).ToString('hh\:mm\:ss')
+        Skipped  = @($sync.Skipped | Where-Object { $_ }).Count
         Error    = [string]$sync.Error
     }
     $list = @(Read-History) + $entry | Select-Object -Last 100
@@ -1096,6 +1100,7 @@ function Update-LastBackup {
     $t = "Last backup: $($last.Time)  |  $($last.Result)"
     if ($last.Bytes) { $t += "  |  $(Format-Bytes $last.Bytes)" }
     $t += "  |  took $($last.Duration)  |  $($last.Trigger.ToLower())"
+    if ($last.Skipped) { $t += "`n$($last.Skipped) file(s) were left out because Windows Security blocked them. The finish message and restore notes list them." }
     if ($last.Result -eq 'Failed' -and $last.Error) { $t += "`n$($last.Error)" }
     $okRuns = @($h | Where-Object { $_.Result -eq 'Succeeded' })
     if ($last.Result -ne 'Succeeded' -and $okRuns.Count) { $t += "`nLast good backup: $($okRuns[-1].Time)" }
@@ -1247,14 +1252,43 @@ $WimBody = {
     }
 
     $ini = Join-Path $env:TEMP ('DriveImager_{0}.ini' -f [guid]::NewGuid().ToString('N'))
-    $sbIni = New-Object System.Text.StringBuilder
-    [void]$sbIni.AppendLine('[ExclusionList]')
-    foreach ($e in $ex) { if ($e.Contains(' ')) { [void]$sbIni.AppendLine('"' + $e + '"') } else { [void]$sbIni.AppendLine($e) } }
-    [void]$sbIni.AppendLine('')
-    [void]$sbIni.AppendLine('[CompressionExclusionList]')
-    foreach ($e in @('*.mp3', '*.mp4', '*.mkv', '*.zip', '*.7z', '*.rar', '*.cab', '*.jpg', '\WINDOWS\inf\*.pnf')) { [void]$sbIni.AppendLine($e) }
-    [IO.File]::WriteAllText($ini, $sbIni.ToString(), (New-Object System.Text.UnicodeEncoding($false, $true)))
-    Write-Log "Leaving out $($ex.Count) paths."
+    function Write-ExclusionIni {
+        $sbIni = New-Object System.Text.StringBuilder
+        [void]$sbIni.AppendLine('[ExclusionList]')
+        foreach ($e in $ex) { if ($e.Contains(' ')) { [void]$sbIni.AppendLine('"' + $e + '"') } else { [void]$sbIni.AppendLine($e) } }
+        [void]$sbIni.AppendLine('')
+        [void]$sbIni.AppendLine('[CompressionExclusionList]')
+        foreach ($e in @('*.mp3', '*.mp4', '*.mkv', '*.zip', '*.7z', '*.rar', '*.cab', '*.jpg', '\WINDOWS\inf\*.pnf')) { [void]$sbIni.AppendLine($e) }
+        [IO.File]::WriteAllText($ini, $sbIni.ToString(), (New-Object System.Text.UnicodeEncoding($false, $true)))
+    }
+
+    # DISM stops the whole capture with code 225 (ERROR_VIRUS_INFECTED) when Windows Security refuses
+    # to let it read a file. dism.log names the file; read only what DISM wrote during this attempt.
+    $dismLog = Join-Path $env:windir 'Logs\DISM\dism.log'
+    function Get-DismLogSize { try { return (Get-Item -LiteralPath $dismLog -ErrorAction Stop).Length } catch { return 0 } }
+    function Get-BlockedFiles([long]$FromOffset, [string]$Root) {
+        $found = New-Object System.Collections.Generic.List[string]
+        $text = ''
+        try {
+            $fs = [IO.File]::Open($dismLog, 'Open', 'Read', 'ReadWrite')
+            try {
+                if ($fs.Length -lt $FromOffset) { $FromOffset = 0 }   # the log rolled over during the capture
+                [void]$fs.Seek($FromOffset, 'Begin')
+                $text = (New-Object IO.StreamReader($fs)).ReadToEnd()
+            } finally { $fs.Dispose() }
+        } catch { return @() }
+        foreach ($m in [regex]::Matches($text, 'PID=\d+ (.+?) \(HRESULT=0x800700E1\)')) {
+            $f = $m.Groups[1].Value.Trim()
+            $r = $Root.TrimEnd('\')
+            if ($f.StartsWith($r + '\', [StringComparison]::OrdinalIgnoreCase)) { $f = $f.Substring($r.Length) }
+            elseif ($f -match '^[A-Za-z]:\\') { $f = $f.Substring(2) }
+            else { continue }
+            if (-not $found.Contains($f)) { $found.Add($f) }
+        }
+        return $found
+    }
+    $skipped = New-Object System.Collections.Generic.List[string]
+    $letterRoot = "$($cfg.SourceLetter):"
 
     try {
         $captureDir = $src
@@ -1288,11 +1322,40 @@ $WimBody = {
         if ($desc) { $dArgs += " /Description:`"$desc`"" }
         if ($cfg.Verify) { $dArgs += ' /Verify' }
         if ($cfg.Integrity) { $dArgs += ' /CheckIntegrity' }
-        Set-Status 'Capturing image' 0
-        Write-Log "dism.exe $dArgs"
-        $code = Invoke-Tool -File $dism -Arguments $dArgs
-        Assert-NotCancelled
-        if ($code -ne 0) { throw "DISM stopped with code $code. More detail is in C:\Windows\Logs\DISM\dism.log" }
+        Write-Log "Leaving out $($ex.Count) paths."
+        $attempt = 0
+        while ($true) {
+            $attempt++
+            Write-ExclusionIni
+            Set-Status $(if ($attempt -eq 1) { 'Capturing image' } else { "Capturing image (attempt $attempt)" }) 0
+            Write-Log "dism.exe $dArgs"
+            $logStart = Get-DismLogSize
+            $code = Invoke-Tool -File $dism -Arguments $dArgs
+            Assert-NotCancelled
+            if ($code -eq 0) { break }
+            if ($code -ne 225) { throw "DISM stopped with code $code. More detail is in C:\Windows\Logs\DISM\dism.log" }
+
+            $blocked = @(Get-BlockedFiles $logStart $captureDir)
+            $new = @($blocked | Where-Object { -not $ex.Contains($_) })
+            if (-not $new.Count) {
+                throw "Windows Security blocked a file that DISM needed to read, but the file could not be identified. Windows Security > Virus & threat protection > Protection history shows which one."
+            }
+            $names = ($new | ForEach-Object { "${letterRoot}$_" }) -join "`n"
+            if (-not $cfg.SkipBlocked) {
+                throw "Windows Security blocked this file, so the backup stopped:`n$names`n`nTurn on 'If Windows Security blocks a file, skip it and finish' to back up everything else."
+            }
+            if ($skipped.Count + $new.Count -gt 25 -or $attempt -ge 12) {
+                throw "Windows Security blocked too many files to keep skipping them. Check Windows Security > Protection history. Blocked so far:`n" + ((@($skipped) + $new | ForEach-Object { "${letterRoot}$_" }) -join "`n")
+            }
+            foreach ($b in $new) {
+                $ex.Add($b); $skipped.Add($b)
+                Write-Log "Windows Security blocked ${letterRoot}$b. Leaving it out of the image."
+            }
+            Write-Log 'Starting the capture again from the same snapshot, without the blocked file(s).'
+            if (Test-Path -LiteralPath $out) { Remove-FileRetry $out }
+        }
+        $sync.Skipped = @($skipped | ForEach-Object { "${letterRoot}$_" })
+        if ($skipped.Count) { Write-Log "Finished with $($skipped.Count) file(s) left out because Windows Security blocked them." }
         $captured = $true
         Write-Log ("Image written: {0}" -f (Format-Bytes (Get-Item -LiteralPath $out).Length))
     }
@@ -1339,6 +1402,10 @@ $WimBody = {
             $isGpt   = ("$($disk.PartitionStyle)" -eq 'GPT')
             $leaf    = Split-Path -Leaf $out
             $hashTxt = $(if ($hash) { $hash } else { 'not calculated' })
+            $skippedTxt = ''
+            if ($sync.Skipped -and @($sync.Skipped).Count) {
+                $skippedTxt = "`r`nNOT IN THIS IMAGE (Windows Security blocked these files):`r`n" + ((@($sync.Skipped) | ForEach-Object { "  $_" }) -join "`r`n") + "`r`n"
+            }
             $netStep = ''
             if ($out.StartsWith('\\')) {
                 $shareRoot = [regex]::Match($out, '^(\\\\[^\\]+\\[^\\]+)').Groups[1].Value
@@ -1395,6 +1462,7 @@ Source drive  : ${letter}:  ($($vol.FileSystemLabel), $(Format-Bytes $vol.Size))
 Image size    : $(Format-Bytes (Get-Item -LiteralPath $out).Length)
 Compression   : $(@('none', 'fast', 'max')[[int]$cfg.Compression])
 SHA256        : $hashTxt
+$skippedTxt
 
 Original disk layout (Disk $($part.DiskNumber), $($disk.PartitionStyle), $(Format-Bytes $disk.Size), $($disk.FriendlyName))
 $($layout -join "`r`n")
@@ -1464,6 +1532,9 @@ recovery partition again, Windows can recreate it later with reagentc.
 
     $sync.OutFile = $out
     $sync.Result = "$out`n$(Format-Bytes (Get-Item -LiteralPath $out).Length)"
+    if ($sync.Skipped -and @($sync.Skipped).Count) {
+        $sync.Result += "`n`nWindows Security blocked these files, so they are NOT in the image:`n" + (@($sync.Skipped) -join "`n")
+    }
     Set-Status 'Finished' 100
 }
 
@@ -1573,7 +1644,7 @@ $UnmountBody = {
 # ---------------------------------------------------------------- job runner
 function Reset-Sync([string]$Title) {
     $sync.Progress = -1; $sync.Status = $Title; $sync.Done = $false; $sync.Success = $false
-    $sync.Cancel = $false; $sync.Process = $null; $sync.Error = $null; $sync.Result = $null; $sync.OutFile = $null
+    $sync.Cancel = $false; $sync.Process = $null; $sync.Error = $null; $sync.Result = $null; $sync.OutFile = $null; $sync.Skipped = $null
 }
 
 function New-WorkerRunspace([scriptblock]$Body, [hashtable]$Cfg) {
@@ -1732,6 +1803,7 @@ function New-BackupPlan($S) {
         Integrity         = [bool]$S.Integrity
         Hash              = [bool]$S.Hash
         Readme            = [bool]$S.Readme
+        SkipBlocked       = [bool]$S.SkipBlocked
         ExTemp            = [bool]$S.ExTemp
         ExWU              = [bool]$S.ExWU
         ExDumps           = [bool]$S.ExDumps
@@ -1857,7 +1929,8 @@ function Invoke-AutoBackup {
     if ($ok) {
         $size = ''
         if ($sync.OutFile -and $kind -eq 'WIM') { try { $size = ' (' + (Format-Bytes (Get-Item -LiteralPath $sync.OutFile).Length) + ')' } catch { } }
-        Show-Notification 'Backup finished' ("Saved $($sync.OutFile)$size") $false
+        $skipNote = $(if ($sync.Skipped -and @($sync.Skipped).Count) { "`n$(@($sync.Skipped).Count) file(s) blocked by Windows Security were left out." } else { '' })
+        Show-Notification 'Backup finished' ("Saved $($sync.OutFile)$size$skipNote") $false
         if ($after -eq 1) { [void][System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $false, $false) }
         elseif ($after -eq 2) { Start-Process -FilePath 'shutdown.exe' -ArgumentList '/s /t 120 /c "Drive Imager finished. Shutting down in 2 minutes. Run shutdown /a to cancel."' -WindowStyle Hidden }
         return 0

@@ -11,6 +11,7 @@ A free backup app for Windows that images a running drive, like C:, into a singl
 * **Save anywhere:** another drive, a USB disk, or a network share. The **Network...** button finds your mapped network drives (even though the app runs as administrator, where Windows normally hides them), signs in to shares that need a password, and tests that it can write there.
 * **Compression:** none, fast or maximum, with a size estimate and a free space check before it starts.
 * **Safety checks:** optional verify while writing, an embedded integrity table, and a SHA256 checksum file next to every image.
+* **Antivirus friendly:** if Windows Security blocks a file (which normally makes DISM abandon the whole backup), Drive Imager leaves that file out, finishes the backup from the same snapshot, and lists exactly what it skipped.
 * **Leaves out junk:** temp folders, the Windows Update cache, crash dumps and the Delivery Optimization cache, plus any folders or files you list.
 * **Keep only the newest** images, so old ones are cleaned up for you.
 * **Scheduled backups:** every day, every week, every 2 weeks or every 4 weeks at the time you pick. Can wake the PC from sleep to run, and shows a notification when each one finishes.
@@ -21,7 +22,7 @@ A free backup app for Windows that images a running drive, like C:, into a singl
 
 ## Download
 
-**[Download DriveImager.exe](https://github.com/NeckromancerCreations/-Drive-Imager/raw/main/DriveImager.exe)** and run it. It uses the PowerShell and .NET Framework that already ship with Windows 10 and 11.
+**[Download DriveImager.exe](https://github.com/NeckromancerCreations/Drive-Imager/raw/main/DriveImager.exe)** and run it. It uses the PowerShell and .NET Framework that already ship with Windows 10 and 11.
 
 It asks for administrator rights when it starts, because Windows only lets admin programs snapshot drives.
 

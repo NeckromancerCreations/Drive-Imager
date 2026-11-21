@@ -53,6 +53,210 @@ public static class DriveImagerNative {
 # Taskbar button progress through ITaskbarList3 directly. Replacement taskbars (StartAllBack, ExplorerPatcher,
 # Bevel95 and similar) may not implement it; WPF's own TaskbarItemInfo then crashes the window, so every call
 # here is guarded and the feature simply switches itself off.
+# Capture engine: WIMGAPI (wimgapi.dll, the library DISM itself is built on) called directly. DISM gives up on
+# the whole capture when one file can't be read. WIMGAPI asks its caller instead (WIM_MSG_ERROR), and answering
+# WIM_MSG_SKIP_ERROR leaves that one file out while the capture keeps going.
+if (-not ('DriveImagerWimCapture' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+
+public class DriveImagerWimCapture {
+    const uint WIM_GENERIC_WRITE = 0x40000000;
+    const uint WIM_CREATE_ALWAYS = 2;
+    const uint WIM_FLAG_VERIFY = 0x2;
+    const uint WIM_MSG = 0x8000 + 0x1476;            // WM_APP + 0x1476
+    const uint WIM_MSG_PROGRESS = WIM_MSG + 2;
+    const uint WIM_MSG_PROCESS = WIM_MSG + 3;
+    const uint WIM_MSG_SCANNING = WIM_MSG + 4;
+    const uint WIM_MSG_ERROR = WIM_MSG + 9;
+    const uint WIM_MSG_WARNING = WIM_MSG + 15;
+    const uint WIM_MSG_SUCCESS = 0;
+    const uint WIM_MSG_SKIP_ERROR = 0xFFFFFFFE;
+    const uint WIM_MSG_ABORT_IMAGE = 0xFFFFFFFF;
+    const uint INVALID_CALLBACK_VALUE = 0xFFFFFFFF;
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    delegate uint WimMessageCallback(uint messageId, IntPtr wParam, IntPtr lParam, IntPtr userData);
+
+    [DllImport("wimgapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr WIMCreateFile(string path, uint access, uint disposition, uint flags, uint compression, out uint creationResult);
+    [DllImport("wimgapi.dll", SetLastError = true)]
+    static extern bool WIMCloseHandle(IntPtr handle);
+    [DllImport("wimgapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool WIMSetTemporaryPath(IntPtr wim, string path);
+    [DllImport("wimgapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr WIMCaptureImage(IntPtr wim, string path, uint flags);
+    [DllImport("wimgapi.dll", SetLastError = true)]
+    static extern bool WIMSetImageInformation(IntPtr image, IntPtr info, uint size);
+    [DllImport("wimgapi.dll", SetLastError = true)]
+    static extern uint WIMRegisterMessageCallback(IntPtr wim, WimMessageCallback callback, IntPtr userData);
+    [DllImport("wimgapi.dll", SetLastError = true)]
+    static extern bool WIMUnregisterMessageCallback(IntPtr wim, WimMessageCallback callback);
+
+    readonly Hashtable sync;
+    readonly string root;
+    readonly string shownRoot;
+    readonly bool skipErrors;
+    readonly List<Regex> anchored = new List<Regex>();
+    readonly List<Regex> byName = new List<Regex>();
+    WimMessageCallback callback;   // kept in a field so the garbage collector can't free it mid-capture
+    string fatalFile;
+    int fatalCode;
+    bool sawProgress;
+
+    public readonly List<string> Skipped = new List<string>();
+    public int Excluded;
+
+    public DriveImagerWimCapture(Hashtable sync, string captureRoot, string[] exclusions, bool skipErrors, string shownRoot) {
+        this.sync = sync;
+        this.root = captureRoot.TrimEnd('\\');
+        this.shownRoot = shownRoot.TrimEnd('\\');
+        this.skipErrors = skipErrors;
+        foreach (string raw in exclusions) {
+            string e = (raw ?? "").Trim().Trim('"');
+            if (e.Length == 0) continue;
+            bool isPath = e.StartsWith("\\");
+            string rx = "^" + Regex.Escape(isPath ? e.TrimEnd('\\') : e).Replace("\\*", "[^\\\\]*").Replace("\\?", "[^\\\\]") + "$";
+            var r = new Regex(rx, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            if (isPath) anchored.Add(r); else byName.Add(r);
+        }
+    }
+
+    // DISM style rules: "\Folder\file" matches that exact path, "\Folder\*" matches everything in the
+    // folder (the folder itself stays), and a pattern with no leading backslash matches a file name anywhere.
+    public bool IsExcluded(string relative) {
+        foreach (var r in anchored) if (r.IsMatch(relative)) return true;
+        int slash = relative.LastIndexOf('\\');
+        string name = slash >= 0 ? relative.Substring(slash + 1) : relative;
+        foreach (var r in byName) if (r.IsMatch(name)) return true;
+        return false;
+    }
+
+    string Relative(string full) {
+        if (full == null) return "";
+        if (full.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return full.Substring(root.Length);
+        return full;
+    }
+
+    string Shown(string full) { return shownRoot + Relative(full); }
+
+    static string Describe(int code) {
+        if (code == 225) return "blocked by Windows Security as a virus or unwanted program";
+        if (code == 5) return "access denied";
+        if (code == 32) return "in use by another program";
+        return new Win32Exception(code).Message.TrimEnd('.', '\r', '\n') + " (code " + code + ")";
+    }
+
+    void Log(string message) {
+        var queue = sync["Log"] as System.Collections.Concurrent.ConcurrentQueue<string>;
+        if (queue != null) queue.Enqueue("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + message);
+    }
+
+    bool Cancelled { get { object c = sync["Cancel"]; return c is bool && (bool)c; } }
+
+    uint OnMessage(uint messageId, IntPtr wParam, IntPtr lParam, IntPtr userData) {
+        try {
+            if (Cancelled) return WIM_MSG_ABORT_IMAGE;
+            switch (messageId) {
+                case WIM_MSG_PROGRESS:
+                    if (!sawProgress) { sawProgress = true; sync["Status"] = "Capturing image"; }
+                    sync["Progress"] = (double)wParam.ToInt64();
+                    break;
+                case WIM_MSG_SCANNING:
+                    if (!sawProgress) sync["Progress"] = -1.0;
+                    break;
+                case WIM_MSG_PROCESS: {
+                    string rel = Relative(Marshal.PtrToStringUni(wParam));
+                    if (rel.Length > 0 && IsExcluded(rel)) {
+                        if (lParam != IntPtr.Zero) Marshal.WriteInt32(lParam, 0);   // *pfProcessFile = FALSE
+                        System.Threading.Interlocked.Increment(ref Excluded);
+                    }
+                    break;
+                }
+                case WIM_MSG_ERROR: {
+                    string file = Shown(Marshal.PtrToStringUni(wParam));
+                    int code = (int)lParam.ToInt64();
+                    if (skipErrors) {
+                        lock (Skipped) Skipped.Add(file + "   (" + Describe(code) + ")");
+                        Log("Skipped " + file + ": Windows would not let it be read, " + Describe(code) + ". The backup keeps going.");
+                        return WIM_MSG_SKIP_ERROR;
+                    }
+                    fatalFile = file; fatalCode = code;
+                    return WIM_MSG_SUCCESS;
+                }
+                case WIM_MSG_WARNING: {
+                    string file = wParam == IntPtr.Zero ? "" : Shown(Marshal.PtrToStringUni(wParam));
+                    int code = (int)lParam.ToInt64();
+                    if (file.Length > 0) Log("Note: " + file + ": " + Describe(code));
+                    break;
+                }
+            }
+        } catch { }
+        return WIM_MSG_SUCCESS;
+    }
+
+    // compression: 0 none, 1 fast (XPRESS), 2 maximum (LZX), the same formats DISM writes
+    public void Run(string wimPath, string tempDir, uint compression, bool integrityTable, bool verify, string name, string description) {
+        uint created;
+        IntPtr wim = WIMCreateFile(wimPath, WIM_GENERIC_WRITE, WIM_CREATE_ALWAYS, integrityTable ? WIM_FLAG_VERIFY : 0, compression, out created);
+        if (wim == IntPtr.Zero) {
+            int e = Marshal.GetLastWin32Error();
+            throw new Exception("Could not create the image file: " + new Win32Exception(e).Message + " (code " + e + ")");
+        }
+        IntPtr image = IntPtr.Zero;
+        Exception failure = null;
+        callback = OnMessage;
+        try {
+            if (!WIMSetTemporaryPath(wim, tempDir)) {
+                int e = Marshal.GetLastWin32Error();
+                throw new Exception("Could not use the temp folder " + tempDir + ": " + new Win32Exception(e).Message);
+            }
+            if (WIMRegisterMessageCallback(wim, callback, IntPtr.Zero) == INVALID_CALLBACK_VALUE)
+                throw new Exception("Could not watch the capture: " + new Win32Exception(Marshal.GetLastWin32Error()).Message);
+
+            image = WIMCaptureImage(wim, root, verify ? WIM_FLAG_VERIFY : 0);
+            if (image == IntPtr.Zero) {
+                int e = Marshal.GetLastWin32Error();
+                if (Cancelled) throw new OperationCanceledException("Cancelled by user.");
+                if (fatalFile != null)
+                    throw new Exception("Windows would not let this file be read, so the backup stopped:\n" + fatalFile + "\n" + Describe(fatalCode)
+                        + "\n\nTurn on \"If Windows won't let a file be read, skip it and keep going\" to back up everything else.");
+                throw new Exception("Windows could not capture the image: " + new Win32Exception(e).Message + " (code " + e + ")");
+            }
+
+            string xml = "﻿<IMAGE><NAME>" + System.Security.SecurityElement.Escape(name ?? "") + "</NAME>"
+                + (string.IsNullOrEmpty(description) ? "" : "<DESCRIPTION>" + System.Security.SecurityElement.Escape(description) + "</DESCRIPTION>")
+                + "</IMAGE>";
+            byte[] bytes = Encoding.Unicode.GetBytes(xml);
+            IntPtr buf = Marshal.AllocHGlobal(bytes.Length);
+            try {
+                Marshal.Copy(bytes, 0, buf, bytes.Length);
+                if (!WIMSetImageInformation(image, buf, (uint)bytes.Length))
+                    Log("Note: the image name and description could not be stored. The image itself is fine.");
+            } finally { Marshal.FreeHGlobal(buf); }
+        }
+        catch (Exception ex) { failure = ex; }
+        finally {
+            if (image != IntPtr.Zero) WIMCloseHandle(image);
+            WIMUnregisterMessageCallback(wim, callback);
+            // Closing the WIM handle is what writes the file's lookup table and header.
+            if (!WIMCloseHandle(wim) && failure == null) {
+                int e = Marshal.GetLastWin32Error();
+                failure = new Exception("The image could not be finished: " + new Win32Exception(e).Message + " (code " + e + ")");
+            }
+        }
+        if (failure != null) throw failure;
+    }
+}
+'@
+}
+
 if (-not ('DriveImagerTaskbar' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -294,7 +498,7 @@ $xaml = @'
                   <CheckBox x:Name="chkIntegrity" Content="Embed an integrity table in the image"/>
                   <CheckBox x:Name="chkHash" Content="Write a SHA256 checksum file when finished"/>
                   <CheckBox x:Name="chkReadme" Content="Write restore instructions next to the image"/>
-                  <CheckBox x:Name="chkSkipBlocked" Content="If Windows Security blocks a file, skip it and finish"/>
+                  <CheckBox x:Name="chkSkipBlocked" Content="If Windows won't let a file be read, skip it and keep going"/>
                 </StackPanel>
               </Border>
 
@@ -1147,7 +1351,7 @@ function Update-LastBackup {
     $t = "Last backup: $($last.Time)  |  $($last.Result)"
     if ($last.Bytes) { $t += "  |  $(Format-Bytes $last.Bytes)" }
     $t += "  |  took $($last.Duration)  |  $($last.Trigger.ToLower())"
-    if ($last.Skipped) { $t += "`n$($last.Skipped) file(s) were left out because Windows Security blocked them. The finish message and restore notes list them." }
+    if ($last.Skipped) { $t += "`n$($last.Skipped) file(s) were skipped because Windows would not let them be read. The finish message and restore notes list them." }
     if ($last.Result -eq 'Failed' -and $last.Error) { $t += "`n$($last.Error)" }
     $okRuns = @($h | Where-Object { $_.Result -eq 'Succeeded' })
     if ($last.Result -ne 'Succeeded' -and $okRuns.Count) { $t += "`nLast good backup: $($okRuns[-1].Time)" }
@@ -1370,6 +1574,26 @@ $WimBody = {
         if ($cfg.Verify) { $dArgs += ' /Verify' }
         if ($cfg.Integrity) { $dArgs += ' /CheckIntegrity' }
         Write-Log "Leaving out $($ex.Count) paths."
+        $wimgapi = Join-Path $env:windir 'System32\wimgapi.dll'
+        if (Test-Path -LiteralPath $wimgapi) {
+            Set-Status 'Scanning files' -1
+            Write-Log "Capturing with the Windows imaging engine. Files Windows won't let be read are $(if ($cfg.SkipBlocked) { 'skipped and listed' } else { 'treated as a failure' })."
+            $cap = New-Object DriveImagerWimCapture -ArgumentList @($sync, $captureDir, [string[]]@($ex), [bool]$cfg.SkipBlocked, $letterRoot)
+            try {
+                $cap.Run($out, $env:TEMP, [uint32]([int]$cfg.Compression), [bool]$cfg.Integrity, [bool]$cfg.Verify, $imgName, $desc)
+            } catch {
+                if ($sync.Cancel) { throw 'Cancelled by user.' }
+                $inner = $_.Exception
+                while ($inner.InnerException) { $inner = $inner.InnerException }
+                throw $inner.Message
+            }
+            Assert-NotCancelled
+            foreach ($sk in $cap.Skipped) { $skipped.Add($sk) }
+            $sync.Skipped = @($cap.Skipped)
+            Write-Log "Left out $($cap.Excluded) excluded files and folders."
+            if ($skipped.Count) { Write-Log "Finished with $($skipped.Count) file(s) skipped because Windows would not let them be read." }
+        } else {
+        Write-Log 'The Windows imaging engine (wimgapi.dll) was not found, so DISM is used instead.'
         $attempt = 0
         while ($true) {
             $attempt++
@@ -1389,7 +1613,7 @@ $WimBody = {
             }
             $names = ($new | ForEach-Object { "${letterRoot}$_" }) -join "`n"
             if (-not $cfg.SkipBlocked) {
-                throw "Windows Security blocked this file, so the backup stopped:`n$names`n`nTurn on 'If Windows Security blocks a file, skip it and finish' to back up everything else."
+                throw "Windows Security blocked this file, so the backup stopped:`n$names`n`nTurn on 'If Windows won't let a file be read, skip it and keep going' to back up everything else."
             }
             if ($skipped.Count + $new.Count -gt 25 -or $attempt -ge 12) {
                 throw "Windows Security blocked too many files to keep skipping them. Check Windows Security > Protection history. Blocked so far:`n" + ((@($skipped) + $new | ForEach-Object { "${letterRoot}$_" }) -join "`n")
@@ -1403,6 +1627,7 @@ $WimBody = {
         }
         $sync.Skipped = @($skipped | ForEach-Object { "${letterRoot}$_" })
         if ($skipped.Count) { Write-Log "Finished with $($skipped.Count) file(s) left out because Windows Security blocked them." }
+        }
         $captured = $true
         Write-Log ("Image written: {0}" -f (Format-Bytes (Get-Item -LiteralPath $out).Length))
     }
@@ -1451,7 +1676,7 @@ $WimBody = {
             $hashTxt = $(if ($hash) { $hash } else { 'not calculated' })
             $skippedTxt = ''
             if ($sync.Skipped -and @($sync.Skipped).Count) {
-                $skippedTxt = "`r`nNOT IN THIS IMAGE (Windows Security blocked these files):`r`n" + ((@($sync.Skipped) | ForEach-Object { "  $_" }) -join "`r`n") + "`r`n"
+                $skippedTxt = "`r`nNOT IN THIS IMAGE (Windows would not let these files be read):`r`n" + ((@($sync.Skipped) | ForEach-Object { "  $_" }) -join "`r`n") + "`r`n"
             }
             $netStep = ''
             if ($out.StartsWith('\\')) {
@@ -1580,7 +1805,7 @@ recovery partition again, Windows can recreate it later with reagentc.
     $sync.OutFile = $out
     $sync.Result = "$out`n$(Format-Bytes (Get-Item -LiteralPath $out).Length)"
     if ($sync.Skipped -and @($sync.Skipped).Count) {
-        $sync.Result += "`n`nWindows Security blocked these files, so they are NOT in the image:`n" + (@($sync.Skipped) -join "`n")
+        $sync.Result += "`n`nWindows would not let these files be read, so they are NOT in the image:`n" + (@($sync.Skipped) -join "`n")
     }
     Set-Status 'Finished' 100
 }
@@ -2040,7 +2265,7 @@ function Invoke-AutoBackup {
     if ($ok) {
         $size = ''
         if ($sync.OutFile -and $kind -eq 'WIM') { try { $size = ' (' + (Format-Bytes (Get-Item -LiteralPath $sync.OutFile).Length) + ')' } catch { } }
-        $skipNote = $(if ($sync.Skipped -and @($sync.Skipped).Count) { "`n$(@($sync.Skipped).Count) file(s) blocked by Windows Security were left out." } else { '' })
+        $skipNote = $(if ($sync.Skipped -and @($sync.Skipped).Count) { "`n$(@($sync.Skipped).Count) file(s) Windows would not let be read were skipped." } else { '' })
         Show-Notification 'Backup finished' ("Saved $($sync.OutFile)$size$skipNote") $false
         if ($after -eq 1) { [void][System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $false, $false) }
         elseif ($after -eq 2) { Start-Process -FilePath 'shutdown.exe' -ArgumentList '/s /t 120 /c "Drive Imager finished. Shutting down in 2 minutes. Run shutdown /a to cancel."' -WindowStyle Hidden }

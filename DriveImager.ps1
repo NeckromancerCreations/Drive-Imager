@@ -50,6 +50,49 @@ public static class DriveImagerNative {
 '@
 }
 
+# Taskbar button progress through ITaskbarList3 directly. Replacement taskbars (StartAllBack, ExplorerPatcher,
+# Bevel95 and similar) may not implement it; WPF's own TaskbarItemInfo then crashes the window, so every call
+# here is guarded and the feature simply switches itself off.
+if (-not ('DriveImagerTaskbar' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+[ComImport, Guid("ea1afb91-9e28-4b86-90e9-9e9f8a5eefaf"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IDriveImagerTaskbarList3 {
+    void HrInit();
+    void AddTab(IntPtr hwnd);
+    void DeleteTab(IntPtr hwnd);
+    void ActivateTab(IntPtr hwnd);
+    void SetActiveAlt(IntPtr hwnd);
+    void MarkFullscreenWindow(IntPtr hwnd, [MarshalAs(UnmanagedType.Bool)] bool fullscreen);
+    void SetProgressValue(IntPtr hwnd, ulong completed, ulong total);
+    void SetProgressState(IntPtr hwnd, int flags);
+}
+
+[ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090"), ClassInterface(ClassInterfaceType.None)]
+class DriveImagerTaskbarListClass { }
+
+public static class DriveImagerTaskbar {
+    static IDriveImagerTaskbarList3 list;
+    static bool off;
+    public static bool Disabled { get { return off; } }
+    // state: 0 none, 1 indeterminate, 2 normal, 4 error, 8 paused
+    public static void Set(IntPtr hwnd, int state, double fraction) {
+        if (off || hwnd == IntPtr.Zero) return;
+        try {
+            if (list == null) { list = (IDriveImagerTaskbarList3)new DriveImagerTaskbarListClass(); list.HrInit(); }
+            list.SetProgressState(hwnd, state);
+            if (state == 2 || state == 4 || state == 8) {
+                if (fraction < 0) fraction = 0; if (fraction > 1) fraction = 1;
+                list.SetProgressValue(hwnd, (ulong)(fraction * 1000), 1000);
+            }
+        } catch { off = true; }
+    }
+}
+'@
+}
+
 # ---------------------------------------------------------------- paths
 $AppDir       = Join-Path $env:APPDATA 'DriveImager'
 $LogDir       = Join-Path $AppDir 'logs'
@@ -1709,11 +1752,14 @@ function Get-StepEta([double]$P) {
 
 function Reset-StepEta { $script:Samples.Clear(); $script:EtaSmooth = -1 }
 
+$script:WindowHandle = [IntPtr]::Zero
 function Set-TaskbarProgress([string]$State, [double]$Value = 0) {
-    $t = $window.TaskbarItemInfo
-    if (-not $t) { return }
-    $t.ProgressState = $State
-    if ($State -ne 'Indeterminate' -and $State -ne 'None') { $t.ProgressValue = [math]::Max(0, [math]::Min(1, $Value)) }
+    try {
+        if ([DriveImagerTaskbar]::Disabled -or -not $window) { return }
+        if ($script:WindowHandle -eq [IntPtr]::Zero) { $script:WindowHandle = (New-Object System.Windows.Interop.WindowInteropHelper $window).Handle }
+        $code = switch ($State) { 'Indeterminate' { 1 } 'Normal' { 2 } 'Error' { 4 } 'Paused' { 8 } default { 0 } }
+        [DriveImagerTaskbar]::Set($script:WindowHandle, $code, $Value)
+    } catch { }
 }
 
 function Start-Worker {
@@ -2207,7 +2253,11 @@ try {
     Update-LastBackup
     if (Enter-JobLock) { Exit-JobLock; Clear-StaleSnapshot }
     Write-UiLog "Drive Imager ready. Logs are kept in $LogDir"
-    $window.TaskbarItemInfo = New-Object System.Windows.Shell.TaskbarItemInfo
+    $window.Dispatcher.Add_UnhandledException({
+        param($sender, $e)
+        $e.Handled = $true
+        try { Write-UiLog "Something went wrong in the window and was ignored: $($e.Exception.Message)" } catch { }
+    })
     $timer.Start()
 
     $h = [DriveImagerNative]::GetConsoleWindow()
